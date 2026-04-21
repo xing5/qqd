@@ -1,0 +1,12 @@
+{
+  "name": "embellama-tests",
+  "version": "1.0.0",
+  "description": "Test scripts for Embellama OpenAI compatibility",
+  "type": "module",
+  "scripts": {
+    "test": "node test-openai-js.mjs"
+  },
+  "dependencies": {
+    "openai": "^4.0.0"
+  }
+}

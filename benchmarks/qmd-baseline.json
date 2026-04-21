@@ -1,0 +1,19 @@
+{
+  "captured_from": "port/qmd",
+  "captured_at": "2026-04-17T17:29:36Z",
+  "notes": "Committed qmd latency baseline for the chosen rust benchmark workload after qqd reached runtime parity. This lets qqd prove a win without requiring Node/qmd at runtime.",
+  "search_json": {
+    "command": "qmd search --json",
+    "iterations": 3,
+    "avg_ms": 439.0,
+    "min_ms": 428,
+    "max_ms": 445
+  },
+  "http_query": {
+    "command": "qmd http query",
+    "iterations": 3,
+    "avg_ms": 3.3333333333333335,
+    "min_ms": 2,
+    "max_ms": 5
+  }
+}

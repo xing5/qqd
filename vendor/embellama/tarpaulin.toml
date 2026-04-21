@@ -1,0 +1,39 @@
+# Tarpaulin Configuration for Code Coverage
+# This config is optimized for unit test coverage in CI environments
+
+[default]
+# Maximum time in seconds without response from test before timeout
+# GitHub CI runners are resource-constrained, so we use a generous timeout
+timeout = 900
+
+# Skip cleaning build artifacts to speed up subsequent runs
+skip-clean = true
+
+# Focus on library code coverage
+# Integration tests that load models are excluded to prevent timeouts
+exclude-files = [
+    "tests/*",
+    "benches/*",
+    "examples/*",
+]
+
+# Run with verbose output for CI debugging
+verbose = true
+
+# Output format for CI (XML for codecov)
+out = ["Xml"]
+
+# Workspace coverage
+workspace = true
+
+# Use all available CPU cores
+jobs = 0
+
+# Don't fail on coverage collection errors for specific tests
+ignore-panics = false
+
+# Forward signals to test processes
+forward = true
+
+# Run in CI mode (less interactive output)
+ciserver = "github-actions"

@@ -1,0 +1,93 @@
+name: 'Setup Build Environment'
+description: 'Install common dependencies for building embellama'
+inputs:
+  rust-toolchain:
+    description: 'Rust toolchain to install'
+    required: false
+    default: 'stable'
+  rust-components:
+    description: 'Rust components to install'
+    required: false
+    default: 'rustfmt'
+  install-just:
+    description: 'Whether to install just'
+    required: false
+    default: 'true'
+  cache-key-prefix:
+    description: 'Prefix for cache key'
+    required: false
+    default: 'cargo'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.rust-toolchain }}
+        components: ${{ inputs.rust-components }}
+
+    - name: Install LLVM and Clang (Ubuntu)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        # Install LLVM 14 and Clang from Ubuntu packages
+        sudo apt-get install -y \
+          clang \
+          llvm \
+          llvm-dev \
+          libclang-dev \
+          cmake \
+          build-essential \
+          libvulkan-dev \
+          libshaderc-dev \
+          glslc
+
+    - name: Install LLVM and Clang (non-Linux)
+      if: runner.os != 'Linux'
+      uses: KyleMayes/install-llvm-action@v2
+      with:
+        version: "14"
+
+    - name: Setup macOS SDK Path
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        export SDKROOT=$(xcrun --show-sdk-path)
+        echo "SDKROOT=$SDKROOT" >> $GITHUB_ENV
+        # Disable i8mm intrinsics for GitHub Actions runners
+        # Use armv8.2-a to avoid i8mm which requires armv8.6-a
+        echo "CFLAGS=-march=armv8.2-a" >> $GITHUB_ENV
+        echo "CXXFLAGS=-march=armv8.2-a" >> $GITHUB_ENV
+
+    - name: Setup CMake (non-Linux)
+      if: runner.os != 'Linux'
+      uses: jwlawson/actions-setup-cmake@v2
+      with:
+        cmake-version: '3.28'
+
+    - name: Install just
+      if: inputs.install-just == 'true'
+      uses: taiki-e/install-action@just
+
+    - name: Cache cargo registry and build
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-${{ inputs.cache-key-prefix }}-${{ inputs.rust-toolchain }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ inputs.cache-key-prefix }}-${{ inputs.rust-toolchain }}-
+          ${{ runner.os }}-${{ inputs.cache-key-prefix }}-
+
+    - name: Cache models
+      uses: actions/cache@v3
+      with:
+        path: models/
+        key: ${{ runner.os }}-models-v1
+        restore-keys: |
+          ${{ runner.os }}-models-

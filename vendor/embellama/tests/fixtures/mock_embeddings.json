@@ -1,0 +1,25 @@
+{
+  "model_info": {
+    "name": "mock-model",
+    "dimensions": 384,
+    "max_tokens": 512,
+    "model_size": 1048576
+  },
+  "sample_embeddings": {
+    "hello_world": [0.1, 0.2, 0.15, 0.25, 0.3, 0.05, 0.12, 0.18],
+    "test_text": [0.05, 0.15, 0.25, 0.35, 0.1, 0.2, 0.08, 0.22],
+    "embedding_test": [0.2, 0.1, 0.3, 0.15, 0.25, 0.12, 0.18, 0.28]
+  },
+  "test_cases": [
+    {
+      "input": "Simple test",
+      "expected_dim": 384,
+      "should_normalize": true
+    },
+    {
+      "input": "Another test case",
+      "expected_dim": 384,
+      "should_normalize": true
+    }
+  ]
+}

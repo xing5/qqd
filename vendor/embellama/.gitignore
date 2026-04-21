@@ -1,0 +1,62 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE directories
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+
+# Test artifacts
+*.profraw
+*.profdata
+
+# Model files (for testing)
+/models/
+*.gguf
+*.bin
+*.safetensors
+
+# Documentation build
+/doc/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Benchmarking
+/criterion/
+perf.data
+perf.data.old
+
+# OS specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Coverage reports
+lcov.info
+coverage/
+*.lcov
+
+# Debug artifacts
+*.dSYM/
+
+# Python cache (for any utility scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+
+server.log
+scripts/package-lock.json
+scripts/node_modules
+*.proptest-regressions

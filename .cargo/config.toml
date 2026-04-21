@@ -1,0 +1,3 @@
+[env]
+LIBCLANG_PATH = { value = ".venv-libclang/lib/python3.14/site-packages/clang/native", relative = true }
+BINDGEN_EXTRA_CLANG_ARGS = "-I/usr/lib/gcc/x86_64-linux-gnu/13/include -I/usr/local/include -I/usr/include/x86_64-linux-gnu -I/usr/include"

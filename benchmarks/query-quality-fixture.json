@@ -1,0 +1,56 @@
+{
+  "name": "qmd-quality-contract",
+  "collection": {
+    "name": "docs",
+    "context": "Performance and retrieval docs"
+  },
+  "documents": [
+    {
+      "path": "alpha.md",
+      "body": "# Alpha\n\nRust benchmark document.\n"
+    },
+    {
+      "path": "beta.md",
+      "body": "# Beta\n\nLatency tuning notes and benchmark results.\n"
+    },
+    {
+      "path": "gamma.md",
+      "body": "# Gamma\n\nSemantic retrieval and hybrid search guidance.\n"
+    },
+    {
+      "path": "delta.md",
+      "body": "# Delta\n\nOffice snacks and lunch menu.\n"
+    }
+  ],
+  "cases": [
+    {
+      "name": "lex_retrieval",
+      "query": "lex: retrieval",
+      "expected_top": "docs/gamma.md",
+      "must_include": [
+        "docs/gamma.md"
+      ],
+      "top_k": 1
+    },
+    {
+      "name": "hybrid_performance_notes",
+      "query": "intent: performance tuning\nlex: latency\nvec: benchmark results",
+      "expected_top": "docs/beta.md",
+      "must_include": [
+        "docs/beta.md",
+        "docs/alpha.md"
+      ],
+      "top_k": 3
+    },
+    {
+      "name": "hybrid_search_quality",
+      "query": "intent: search quality\nlex: hybrid search\nvec: semantic retrieval",
+      "expected_top": "docs/gamma.md",
+      "must_include": [
+        "docs/gamma.md"
+      ],
+      "top_k": 1
+    }
+  ],
+  "minimum_pass_rate": 1.0
+}
