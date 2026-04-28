@@ -4,16 +4,17 @@
 qmd-compatible SQLite index, supports lexical and vector search, and can expose
 the same index through an MCP server for agent use.
 
-## Build
+## Install
 
 ```bash
-cargo build --release
+cargo install --path .
 ```
 
-Use the release binary for benchmarks and regular indexing:
+This installs `qqd` into Cargo's bin directory, usually `~/.cargo/bin`. Make
+sure that directory is on `PATH`, then run:
 
 ```bash
-./target/release/qqd --help
+qqd --help
 ```
 
 `qqd` auto-discovers local GGUF models from `~/.cache/qmd/models`. You can
@@ -65,28 +66,28 @@ named index so it does not mix with the default qmd/qqd index:
 
 ```bash
 cd /home/xing/workspace/qqd
-QQD=/home/xing/workspace/qqd/target/release/qqd
+cargo install --path .
 
-$QQD --index xkb collection add ~/workspace/xkb/runtime/items --name xkb-items
-$QQD --index xkb embed
-$QQD --index xkb status
+qqd --index xkb collection add ~/workspace/xkb/runtime/items --name xkb-items
+qqd --index xkb embed
+qqd --index xkb status
 ```
 
 Query it:
 
 ```bash
-$QQD --index xkb query "how does runtime item scheduling work?"
-$QQD --index xkb search "scheduled runtime item"
-$QQD --index xkb vsearch "find notes about background jobs"
+qqd --index xkb query "how does runtime item scheduling work?"
+qqd --index xkb search "scheduled runtime item"
+qqd --index xkb vsearch "find notes about background jobs"
 ```
 
 Browse or fetch documents:
 
 ```bash
-$QQD --index xkb collection list
-$QQD --index xkb collection show xkb-items
-$QQD --index xkb ls xkb-items
-$QQD --index xkb get 'qmd://xkb-items/path/to/file.md'
+qqd --index xkb collection list
+qqd --index xkb collection show xkb-items
+qqd --index xkb ls xkb-items
+qqd --index xkb get 'qmd://xkb-items/path/to/file.md'
 ```
 
 The default collection pattern is `**/*.md`. The xkb directory currently has
@@ -94,16 +95,15 @@ Markdown, JSON, images, videos, and PDFs; the command above indexes the Markdown
 files only. To also index JSON as raw text, add a second collection:
 
 ```bash
-$QQD --index xkb collection add ~/workspace/xkb/runtime/items --name xkb-json --mask '**/*.json'
-$QQD --index xkb embed
+qqd --index xkb collection add ~/workspace/xkb/runtime/items --name xkb-json --mask '**/*.json'
+qqd --index xkb embed
 ```
 
 ## BEIR SciFact Benchmark
 
 Latest measured benchmark: BEIR SciFact, 5,183 documents, 300 scored qrel
-queries, top-k 100. `qqd` was run from `target/release/qqd`; `qmd` was the
-installed local command. Runs were executed sequentially to avoid resource
-contention.
+queries, top-k 100. `qqd` was run as a release build; `qmd` was the installed
+local command. Runs were executed sequentially to avoid resource contention.
 
 | Metric | qmd | qqd release |
 | --- | ---: | ---: |
