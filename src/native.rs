@@ -1,4 +1,4 @@
-use crate::models;
+use crate::{models, sqlite_vec};
 use anyhow::{Context, Result, anyhow};
 use percent_encoding::percent_decode_str;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -7,6 +7,17 @@ use serde_json::json;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
+
+const DEFAULT_EMBED_MAX_DOCS_PER_BATCH: usize = 512;
+const DEFAULT_EMBED_MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
+const CHUNK_SIZE_TOKENS: usize = 900;
+const EMBED_CHUNK_SIZE_CHARS: usize = 2700;
+const EMBED_CHUNK_OVERLAP_CHARS: usize = 405;
+const EMBED_CHUNK_WINDOW_CHARS: usize = 600;
+const RERANK_CHUNK_SIZE_CHARS: usize = 3600;
+const RERANK_CHUNK_OVERLAP_CHARS: usize = 540;
+const RERANK_CHUNK_WINDOW_CHARS: usize = 800;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchConfig {
@@ -129,6 +140,8 @@ pub struct CleanupConfig {
 pub struct EmbedConfig {
     pub index_name: Option<String>,
     pub force: bool,
+    pub max_docs_per_batch: Option<usize>,
+    pub max_batch_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +224,27 @@ struct CandidateScoringOptions<'a> {
     rerank: bool,
     min_score: f64,
     limit: usize,
+}
+
+#[derive(Debug, Clone)]
+struct EmbedChunk {
+    hash: String,
+    title: String,
+    seq: usize,
+    pos: usize,
+    text: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BreakPoint {
+    pos: usize,
+    score: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CodeFenceRegion {
+    start: usize,
+    end: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -816,15 +850,40 @@ impl EmbedConfig {
         }
 
         let mut force = false;
-        for arg in &rest[1..] {
-            match arg.as_str() {
+        let mut max_docs_per_batch = None;
+        let mut max_batch_bytes = None;
+        let mut idx = 1usize;
+        while idx < rest.len() {
+            match rest[idx].as_str() {
                 "-f" | "--force" => force = true,
+                "--max-docs-per-batch" => {
+                    let value = rest
+                        .get(idx + 1)
+                        .ok_or_else(|| anyhow!("--max-docs-per-batch requires a value"))?;
+                    max_docs_per_batch =
+                        Some(parse_positive_integer_option("max-docs-per-batch", value)?);
+                    idx += 1;
+                }
+                "--max-batch-mb" => {
+                    let value = rest
+                        .get(idx + 1)
+                        .ok_or_else(|| anyhow!("--max-batch-mb requires a value"))?;
+                    max_batch_bytes =
+                        Some(parse_positive_integer_option("max-batch-mb", value)? * 1024 * 1024);
+                    idx += 1;
+                }
                 unsupported if unsupported.starts_with('-') => return Ok(None),
                 _ => return Ok(None),
             }
+            idx += 1;
         }
 
-        Ok(Some(Self { index_name, force }))
+        Ok(Some(Self {
+            index_name,
+            force,
+            max_docs_per_batch,
+            max_batch_bytes,
+        }))
     }
 }
 
@@ -859,8 +918,11 @@ pub fn run_search(config: &SearchConfig) -> Result<()> {
 pub fn run_vsearch(config: &VSearchConfig) -> Result<()> {
     let connection = open_readwrite(config.index_name.as_deref())?;
     ensure_schema(&connection)?;
-    ensure_qqd_vectors_if_qmd_vectors_exist(&connection)?;
-    if has_native_vectors(&connection)? {
+    let vec0_ready = sqlite_vec::vectors_vec_is_usable(&connection)?;
+    if !vec0_ready {
+        ensure_qqd_vectors_if_qmd_vectors_exist(&connection)?;
+    }
+    if vec0_ready || has_native_vectors(&connection)? {
         let runtime = models::runtime()?;
         let results = vector_results(
             &connection,
@@ -906,7 +968,9 @@ pub fn run_vsearch(config: &VSearchConfig) -> Result<()> {
 pub fn run_query(config: &QueryConfig) -> Result<()> {
     let connection = open_readwrite(config.index_name.as_deref())?;
     ensure_schema(&connection)?;
-    ensure_qqd_vectors_if_qmd_vectors_exist(&connection)?;
+    if !sqlite_vec::vectors_vec_is_usable(&connection)? {
+        ensure_qqd_vectors_if_qmd_vectors_exist(&connection)?;
+    }
     let results = query_results(
         &connection,
         &config.query,
@@ -1382,7 +1446,7 @@ pub fn run_collection_show(config: &CollectionShowConfig) -> Result<()> {
 }
 
 pub fn run_collection_add(config: &CollectionAddConfig) -> Result<()> {
-    let connection = open_readwrite(config.index_name.as_deref())?;
+    let mut connection = open_readwrite(config.index_name.as_deref())?;
     ensure_schema(&connection)?;
     let mut file_config = load_file_config(config.index_name.as_deref())?;
     let resolved_path = resolve_context_fs_path(&config.path)?;
@@ -1418,7 +1482,8 @@ pub fn run_collection_add(config: &CollectionAddConfig) -> Result<()> {
 
     println!("Creating collection '{}'...", name);
     println!("Collection: {} ({})", resolved_path, config.pattern);
-    let result = reindex_collection_native(&connection, &resolved_path, &config.pattern, &name)?;
+    let result =
+        reindex_collection_native(&mut connection, &resolved_path, &config.pattern, &name)?;
     println!();
     println!(
         "Indexed: {} new, {} updated, {} unchanged, {} removed",
@@ -1624,7 +1689,7 @@ pub fn run_context_remove(config: &ContextRemoveConfig) -> Result<()> {
 }
 
 pub fn run_update(config: &UpdateConfig) -> Result<()> {
-    let connection = open_readwrite(config.index_name.as_deref())?;
+    let mut connection = open_readwrite(config.index_name.as_deref())?;
     ensure_schema(&connection)?;
     let file_config = load_file_config(config.index_name.as_deref())?;
     if file_config.collections.is_empty() {
@@ -1668,8 +1733,12 @@ pub fn run_update(config: &UpdateConfig) -> Result<()> {
         }
 
         println!("Collection: {} ({})", collection.path, collection.pattern);
-        let result =
-            reindex_collection_native(&connection, &collection.path, &collection.pattern, name)?;
+        let result = reindex_collection_native(
+            &mut connection,
+            &collection.path,
+            &collection.pattern,
+            name,
+        )?;
         println!(
             "\nIndexed: {} new, {} updated, {} unchanged, {} removed\n",
             result.indexed, result.updated, result.unchanged, result.removed
@@ -1695,11 +1764,29 @@ pub fn run_cleanup(config: &CleanupConfig) -> Result<()> {
     println!("✓ Cleared {} cached API responses", cache_count);
 
     let orphaned_vecs = if table_exists(&connection, "vectors_vec")? {
-        connection.execute(
-            "DELETE FROM content_vectors
-             WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)",
-            [],
-        )?
+        if let Some(path) = sqlite_vec::discover_vec0_path() {
+            if sqlite_vec::load_vec0_extension(&connection, &path).is_ok() {
+                connection.execute(
+                    "DELETE FROM vectors_vec WHERE hash_seq IN (
+                       SELECT cv.hash || '_' || cv.seq
+                       FROM content_vectors cv
+                       WHERE NOT EXISTS (
+                         SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1
+                       )
+                     )",
+                    [],
+                )?;
+                connection.execute(
+                    "DELETE FROM content_vectors
+                     WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)",
+                    [],
+                )?
+            } else {
+                0
+            }
+        } else {
+            0
+        }
     } else {
         0
     };
@@ -1720,26 +1807,57 @@ pub fn run_cleanup(config: &CleanupConfig) -> Result<()> {
 }
 
 pub fn run_embed(config: &EmbedConfig) -> Result<()> {
-    let connection = open_readwrite(config.index_name.as_deref())?;
+    let trace_enabled = trace_indexing_enabled();
+    let total_start = Instant::now();
+    let mut trace = EmbedTrace::default();
+    let mut connection = open_readwrite(config.index_name.as_deref())?;
     ensure_schema(&connection)?;
+    ensure_qqd_vectors_schema(&connection)?;
+    let runtime_start = Instant::now();
     let runtime = models::runtime()?;
+    trace.runtime_init_ms = elapsed_ms(runtime_start);
+    let vec0_path = sqlite_vec::discover_vec0_path();
+    let mut vec0_ready = false;
 
     if config.force {
-        connection.execute("DELETE FROM qqd_vectors", [])?;
+        if table_exists(&connection, "qqd_vectors")? {
+            connection.execute("DELETE FROM qqd_vectors", [])?;
+        }
         connection.execute("DELETE FROM content_vectors", [])?;
+        if let Some(path) = vec0_path.as_deref() {
+            if sqlite_vec::load_vec0_extension(&connection, path).is_ok() {
+                connection.execute_batch("DROP TABLE IF EXISTS vectors_vec")?;
+            }
+        }
     }
 
+    let docs_query_start = Instant::now();
     let docs = connection
-        .prepare(
-            "SELECT c.hash, c.doc
+        .prepare(if config.force {
+            "SELECT c.hash, MIN(d.title), c.doc
              FROM content c
-             WHERE EXISTS (SELECT 1 FROM documents d WHERE d.hash = c.hash AND d.active = 1)
-             ORDER BY c.hash",
-        )?
+             JOIN documents d ON d.hash = c.hash AND d.active = 1
+             GROUP BY c.hash, c.doc
+             ORDER BY c.hash"
+        } else {
+            "SELECT c.hash, MIN(d.title), c.doc
+             FROM content c
+             JOIN documents d ON d.hash = c.hash AND d.active = 1
+             WHERE EXISTS (SELECT 1 FROM documents d2 WHERE d2.hash = c.hash AND d2.active = 1)
+               AND NOT EXISTS (SELECT 1 FROM qqd_vectors qv WHERE qv.hash = c.hash)
+             GROUP BY c.hash, c.doc
+             ORDER BY c.hash"
+        })?
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    trace.docs_query_ms = elapsed_ms(docs_query_start);
+    trace.docs_seen = docs.len();
 
     if docs.is_empty() {
         println!("✓ No non-empty documents to embed.");
@@ -1749,50 +1867,163 @@ pub fn run_embed(config: &EmbedConfig) -> Result<()> {
     let now = current_timestamp();
     let mut embedded = 0usize;
     let backend_id = models::embed_backend_id_for_runtime(runtime.as_deref());
-    let texts = docs
-        .iter()
-        .map(|(_, body)| body.as_str())
-        .collect::<Vec<_>>();
-    let vectors = compute_embeddings(runtime.as_deref(), texts.as_slice())?;
-    for ((hash, _body), vector) in docs.into_iter().zip(vectors.into_iter()) {
-        let exists = if config.force {
-            false
-        } else {
-            connection
-                .prepare("SELECT 1 FROM qqd_vectors WHERE hash = ?1 LIMIT 1")?
-                .exists([hash.as_str()])?
-        };
-        if exists {
-            continue;
+    let model_name = if runtime
+        .as_deref()
+        .map(|value| value.has_embedder())
+        .unwrap_or(false)
+    {
+        "qqd-gguf"
+    } else {
+        "qqd-deterministic"
+    };
+    let max_docs_per_batch = config
+        .max_docs_per_batch
+        .unwrap_or(DEFAULT_EMBED_MAX_DOCS_PER_BATCH);
+    let max_batch_bytes = config
+        .max_batch_bytes
+        .unwrap_or(DEFAULT_EMBED_MAX_BATCH_BYTES);
+    let mut batch_start = 0usize;
+    let mut batch_index = 0usize;
+    while batch_start < docs.len() {
+        let batch_total_start = Instant::now();
+        let batch_end =
+            next_embed_batch_end(&docs, batch_start, max_docs_per_batch, max_batch_bytes);
+        let batch = &docs[batch_start..batch_end];
+        trace.batches += 1;
+        let mut doc_ranges = Vec::with_capacity(batch.len());
+        let mut batch_chunks = Vec::new();
+        for (hash, title, body) in batch {
+            let start = batch_chunks.len();
+            let chunks = chunk_document_for_embedding(runtime.as_deref(), body);
+            for (seq, (pos, text)) in chunks.into_iter().enumerate() {
+                batch_chunks.push(EmbedChunk {
+                    hash: hash.clone(),
+                    title: title.clone(),
+                    seq,
+                    pos,
+                    text,
+                });
+            }
+            let end = batch_chunks.len();
+            doc_ranges.push((hash.as_str(), start, end));
         }
-
-        connection.execute(
-            "INSERT INTO qqd_vectors (hash, vector, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(hash) DO UPDATE SET vector = excluded.vector, updated_at = excluded.updated_at",
-            (hash.as_str(), serde_json::to_string(&vector)?, now.as_str()),
-        )?;
-        connection.execute(
-            "DELETE FROM content_vectors WHERE hash = ?1",
-            [hash.as_str()],
-        )?;
-        let model_name = if runtime
-            .as_deref()
-            .map(|value| value.has_embedder())
-            .unwrap_or(false)
-        {
-            "qqd-gguf"
-        } else {
-            "qqd-deterministic"
-        };
-        connection.execute(
-            "INSERT INTO content_vectors (hash, seq, pos, model, embedded_at)
-             VALUES (?1, 0, 0, ?2, ?3)",
-            (hash.as_str(), model_name, now.as_str()),
-        )?;
-        embedded += 1;
+        let texts = batch_chunks
+            .iter()
+            .map(|chunk| models::format_document_for_embedding(&chunk.text, Some(&chunk.title)))
+            .collect::<Vec<_>>();
+        let text_refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+        let compute_start = Instant::now();
+        let vectors = compute_embeddings(runtime.as_deref(), text_refs.as_slice())?;
+        trace.compute_embeddings_ms += elapsed_ms(compute_start);
+        if !vec0_ready && !vectors.is_empty() {
+            if let Some(path) = vec0_path.as_deref() {
+                sqlite_vec::load_vec0_extension(&connection, path)?;
+                sqlite_vec::ensure_vec0_table(&connection, "vectors_vec", vectors[0].len())?;
+                vec0_ready = true;
+            }
+        }
+        if !vec0_ready {
+            ensure_qqd_vectors_schema(&connection)?;
+        }
+        let tx = connection.transaction()?;
+        let mut doc_vectors = std::collections::BTreeMap::<String, Vec<Vec<f32>>>::new();
+        for (chunk, vector) in batch_chunks.iter().zip(vectors.into_iter()) {
+            let serialize_start = Instant::now();
+            let vector_json = serde_json::to_string(&vector)?;
+            trace.serialize_vectors_ms += elapsed_ms(serialize_start);
+            let content_vector_delete_start = Instant::now();
+            tx.execute(
+                "DELETE FROM content_vectors WHERE hash = ?1 AND seq = ?2",
+                (&chunk.hash, chunk.seq as i64),
+            )?;
+            trace.content_vector_delete_ms += elapsed_ms(content_vector_delete_start);
+            let content_vector_insert_start = Instant::now();
+            tx.execute(
+                "INSERT INTO content_vectors (hash, seq, pos, model, embedded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                (
+                    &chunk.hash,
+                    chunk.seq as i64,
+                    chunk.pos as i64,
+                    model_name,
+                    now.as_str(),
+                ),
+            )?;
+            trace.content_vector_insert_ms += elapsed_ms(content_vector_insert_start);
+            if vec0_ready {
+                let hash_seq = format!("{}_{}", chunk.hash, chunk.seq);
+                tx.execute("DELETE FROM vectors_vec WHERE hash_seq = ?1", [&hash_seq])?;
+                tx.execute(
+                    "INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?1, ?2)",
+                    (&hash_seq, &vector_json),
+                )?;
+            }
+            doc_vectors
+                .entry(chunk.hash.clone())
+                .or_default()
+                .push(vector);
+            embedded += 1;
+        }
+        for (hash, start, end) in doc_ranges {
+            if start == end {
+                continue;
+            }
+            let Some(vectors) = doc_vectors.get(hash) else {
+                continue;
+            };
+            if !vec0_ready {
+                let averaged = average_embeddings(vectors);
+                let qqd_vector_write_start = Instant::now();
+                tx.execute(
+                    "INSERT INTO qqd_vectors (hash, vector, updated_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(hash) DO UPDATE SET vector = excluded.vector, updated_at = excluded.updated_at",
+                    (hash, serde_json::to_string(&averaged)?, now.as_str()),
+                )?;
+                trace.qqd_vector_write_ms += elapsed_ms(qqd_vector_write_start);
+            }
+        }
+        let tx_commit_start = Instant::now();
+        tx.commit()?;
+        trace.tx_commit_ms += elapsed_ms(tx_commit_start);
+        let batch_total_ms = elapsed_ms(batch_total_start);
+        if batch_total_ms > trace.slowest_batch_ms {
+            trace.slowest_batch_ms = batch_total_ms;
+            trace.slowest_batch_index = batch_index;
+            trace.slowest_batch_docs = batch.len();
+        }
+        batch_start = batch_end;
+        batch_index += 1;
     }
     write_store_config_value(&connection, "qqd_embed_backend", &backend_id)?;
+    trace.total_ms = elapsed_ms(total_start);
+
+    if trace_enabled {
+        eprintln!(
+            "QQD_EMBED_TRACE {}",
+            serde_json::to_string(&json!({
+                "docs_seen": trace.docs_seen,
+                "batches": trace.batches,
+                "embedded": embedded,
+                "phase_ms": {
+                    "runtime_init": trace.runtime_init_ms,
+                    "docs_query": trace.docs_query_ms,
+                    "compute_embeddings": trace.compute_embeddings_ms,
+                    "serialize_vectors": trace.serialize_vectors_ms,
+                    "qqd_vector_write": trace.qqd_vector_write_ms,
+                    "content_vector_delete": trace.content_vector_delete_ms,
+                    "content_vector_insert": trace.content_vector_insert_ms,
+                    "tx_commit": trace.tx_commit_ms,
+                    "total": trace.total_ms,
+                },
+                "slowest_batch": {
+                    "index": trace.slowest_batch_index,
+                    "docs": trace.slowest_batch_docs,
+                    "ms": trace.slowest_batch_ms,
+                },
+            }))?
+        );
+    }
 
     if embedded == 0 {
         println!("✓ All content hashes already have embeddings.");
@@ -1847,7 +2078,7 @@ pub fn run_help() -> Result<()> {
 Usage:\n  qqd <command> [options]\n\n\
 Primary commands:\n  qqd query <query>             - Hybrid search with auto expansion + reranking (recommended)\n  qqd query 'lex:..\\nvec:...'   - Structured query document (you provide lex/vec/hyde lines)\n  qqd search <query>            - Full-text BM25 keywords (no LLM)\n  qqd vsearch <query>           - Vector similarity only\n  qqd get <file>[:line] [-l N]  - Show a single document, optional line slice\n  qqd multi-get <pattern>       - Batch fetch via glob or comma-separated list\n  qqd mcp                       - Start the MCP server (stdio transport for AI agents)\n  qqd bench-latency <query>     - Compare qqd vs qmd latency on a selected workload\n  qqd bench-quality <fixture>   - Run the committed query-quality gate fixture\n  qqd bench-metrics <fixture>   - Report precision/recall/F1/MRR/nDCG on a fixture\n\n\
 Collections & context:\n  qqd collection add/list/remove/rename/show   - Manage indexed folders\n  qqd context add/list/rm                      - Attach human-written summaries\n  qqd ls [collection[/path]]                   - Inspect indexed files\n\n\
-Maintenance:\n  qqd status                    - View index + collection health\n  qqd update                    - Re-index collections\n  qqd embed [-f]                - Generate/refresh vector embeddings\n  qqd cleanup                   - Clear caches, vacuum DB\n\n\
+Maintenance:\n  qqd status                    - View index + collection health\n  qqd update                    - Re-index collections\n  qqd embed [-f]                - Generate/refresh vector embeddings\n    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch\n    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch\n  qqd cleanup                   - Clear caches, vacuum DB\n\n\
 Global options:\n  --index <name>             - Use a named index (default: index)\n  QMD_EDITOR_URI             - Editor link template for clickable TTY search output\n\n\
 Local model setup:\n  - qqd auto-discovers GGUF models from ~/.cache/qmd/models to match qmd-style setup.\n  - Optional overrides: QQD_EMBED_MODEL, QQD_RERANK_MODEL, QQD_MODEL_THREADS.\n  - Discovered embed model: {}\n  - Discovered rerank model: {}\n\n\
 Index: {}\n",
@@ -2061,28 +2292,39 @@ fn ensure_qqd_vectors_if_qmd_vectors_exist(connection: &Connection) -> Result<()
     if !has_qmd_vector_state(connection)? {
         return Ok(());
     }
+    ensure_qqd_vectors_schema(connection)?;
     let now = current_timestamp();
     let docs = connection
         .prepare(
-            "SELECT c.hash, c.doc
+            "SELECT c.hash, MIN(d.title), c.doc
              FROM content c
-             WHERE EXISTS (SELECT 1 FROM documents d WHERE d.hash = c.hash AND d.active = 1)
+             JOIN documents d ON d.hash = c.hash AND d.active = 1
+             GROUP BY c.hash, c.doc
              ORDER BY c.hash",
         )?
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let runtime = models::runtime()?;
     let backend_id = models::embed_backend_id_for_runtime(runtime.as_deref());
+    let texts = docs
+        .iter()
+        .map(|(_, title, body)| models::format_document_for_embedding(body, Some(title)))
+        .collect::<Vec<_>>();
     let vectors = compute_embeddings(
         runtime.as_deref(),
-        docs.iter()
-            .map(|(_, body)| body.as_str())
+        texts
+            .iter()
+            .map(String::as_str)
             .collect::<Vec<_>>()
             .as_slice(),
     )?;
-    for ((hash, _body), vector) in docs.into_iter().zip(vectors.into_iter()) {
+    for ((hash, _title, _body), vector) in docs.into_iter().zip(vectors.into_iter()) {
         connection.execute(
             "INSERT INTO qqd_vectors (hash, vector, updated_at)
              VALUES (?1, ?2, ?3)
@@ -2119,7 +2361,7 @@ fn query_results(
     } else {
         options.collections.to_vec()
     };
-    let candidate_limit = options.limit.max(20);
+    let candidate_limit = options.limit.max(40);
     let mut ranked_lists = Vec::new();
     for search in &searches {
         let results = match search.kind {
@@ -2214,7 +2456,9 @@ pub fn query_results_for_mcp(
 ) -> Result<Vec<McpSearchResult>> {
     let connection = open_readwrite(index_name)?;
     ensure_schema(&connection)?;
-    ensure_qqd_vectors_if_qmd_vectors_exist(&connection)?;
+    if !sqlite_vec::vectors_vec_is_usable(&connection)? {
+        ensure_qqd_vectors_if_qmd_vectors_exist(&connection)?;
+    }
     let query_doc = searches
         .iter()
         .filter_map(|search| {
@@ -2268,7 +2512,14 @@ fn rerank_or_score_candidates(
                     .unwrap_or_else(|| options.primary_query.to_string());
                 let documents = candidates
                     .iter()
-                    .map(|(_, _, item)| candidate_rerank_text(item))
+                    .map(|(_, _, item)| {
+                        let (_pos, best_chunk) = best_chunk_for_query(
+                            &item.rerank_text,
+                            options.primary_terms,
+                            options.intent_terms,
+                        );
+                        format!("# {}\n\n{}", item.title, best_chunk)
+                    })
                     .collect::<Vec<_>>();
                 let document_refs = documents.iter().map(String::as_str).collect::<Vec<_>>();
                 let reranked = runtime.rerank(&rerank_query, &document_refs)?;
@@ -2348,16 +2599,35 @@ fn compute_embeddings(
     runtime: Option<&models::LocalModelRuntime>,
     texts: &[&str],
 ) -> Result<Vec<Vec<f32>>> {
-    texts
-        .iter()
-        .map(|text| compute_embedding(runtime, text))
-        .collect()
+    match runtime {
+        Some(runtime) if runtime.has_embedder() => compute_live_embeddings(runtime, texts),
+        _ => texts
+            .iter()
+            .map(|text| compute_embedding(runtime, text))
+            .collect(),
+    }
 }
 
 fn compute_embedding(runtime: Option<&models::LocalModelRuntime>, text: &str) -> Result<Vec<f32>> {
     match runtime {
         Some(runtime) if runtime.has_embedder() => compute_live_embedding(runtime, text),
         _ => Ok(embed_text(text)),
+    }
+}
+
+fn compute_live_embeddings(
+    runtime: &models::LocalModelRuntime,
+    texts: &[&str],
+) -> Result<Vec<Vec<f32>>> {
+    match runtime.embed_texts(texts) {
+        Ok(vectors) => Ok(vectors),
+        Err(_) => {
+            let mut all_vectors = Vec::with_capacity(texts.len());
+            for text in texts {
+                all_vectors.push(compute_live_embedding(runtime, text)?);
+            }
+            Ok(all_vectors)
+        }
     }
 }
 
@@ -2396,10 +2666,6 @@ fn chunked_live_embedding(
         .map(|chunk| compute_live_embedding(runtime, chunk))
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(average_embeddings(&chunk_vectors)))
-}
-
-fn candidate_rerank_text(item: &SearchResultItem) -> String {
-    format!("# {}\n\n{}", item.title, item.rerank_text)
 }
 
 fn split_text_for_embedding(text: &str, target_chars: usize) -> Vec<String> {
@@ -2464,6 +2730,371 @@ fn split_line_for_embedding(line: &str, target_chars: usize) -> Vec<String> {
     } else {
         chunks
     }
+}
+
+fn chunk_document_for_embedding(
+    runtime: Option<&models::LocalModelRuntime>,
+    content: &str,
+) -> Vec<(usize, String)> {
+    if let Some(runtime) = runtime.filter(|runtime| runtime.has_embedder()) {
+        return token_limited_chunks(runtime, content);
+    }
+    chunk_document_charwise(
+        content,
+        EMBED_CHUNK_SIZE_CHARS,
+        EMBED_CHUNK_OVERLAP_CHARS,
+        EMBED_CHUNK_WINDOW_CHARS,
+    )
+}
+
+fn chunk_document_for_rerank(content: &str) -> Vec<(usize, String)> {
+    chunk_document_charwise(
+        content,
+        RERANK_CHUNK_SIZE_CHARS,
+        RERANK_CHUNK_OVERLAP_CHARS,
+        RERANK_CHUNK_WINDOW_CHARS,
+    )
+}
+
+fn best_chunk_for_query(
+    content: &str,
+    query_terms: &[String],
+    intent_terms: &[String],
+) -> (usize, String) {
+    let chunks = chunk_document_for_rerank(content);
+    if chunks.is_empty() {
+        return (0, content.to_string());
+    }
+    let mut best = 0usize;
+    let mut best_score = -1.0f64;
+    for (idx, (_pos, text)) in chunks.iter().enumerate() {
+        let lower = text.to_ascii_lowercase();
+        let mut score = 0.0f64;
+        for term in query_terms {
+            if lower.contains(term) {
+                score += 1.0;
+            }
+        }
+        for term in intent_terms {
+            if lower.contains(term) {
+                score += 0.5;
+            }
+        }
+        if score > best_score {
+            best_score = score;
+            best = idx;
+        }
+    }
+    chunks[best].clone()
+}
+
+fn token_limited_chunks(
+    runtime: &models::LocalModelRuntime,
+    content: &str,
+) -> Vec<(usize, String)> {
+    let char_chunks = chunk_document_charwise(
+        content,
+        EMBED_CHUNK_SIZE_CHARS,
+        EMBED_CHUNK_OVERLAP_CHARS,
+        EMBED_CHUNK_WINDOW_CHARS,
+    );
+    let mut results = Vec::new();
+    for (chunk_pos, chunk_text) in char_chunks {
+        push_chunk_within_token_limit(runtime, &chunk_text, chunk_pos, &mut results);
+    }
+    if results.is_empty() {
+        vec![(0, content.to_string())]
+    } else {
+        results
+    }
+}
+
+fn push_chunk_within_token_limit(
+    runtime: &models::LocalModelRuntime,
+    text: &str,
+    pos: usize,
+    results: &mut Vec<(usize, String)>,
+) {
+    let Ok(tokens) = runtime.tokenize_embedding_text(text) else {
+        results.push((pos, text.to_string()));
+        return;
+    };
+    if tokens.len() <= CHUNK_SIZE_TOKENS || text.len() <= 1 {
+        results.push((pos, text.to_string()));
+        return;
+    }
+
+    let actual_chars_per_token = text.len() as f64 / tokens.len() as f64;
+    let mut safe_max_chars = (CHUNK_SIZE_TOKENS as f64 * actual_chars_per_token * 0.95).floor();
+    if !safe_max_chars.is_finite() || safe_max_chars < 1.0 {
+        safe_max_chars = (text.len() / 2) as f64;
+    }
+    let safe_max_chars = safe_max_chars
+        .max(1.0)
+        .min((text.len().saturating_sub(1)) as f64) as usize;
+
+    let next_overlap_chars = clamp_overlap_chars(
+        (EMBED_CHUNK_OVERLAP_CHARS as f64 * actual_chars_per_token / 2.0).floor() as usize,
+        safe_max_chars,
+    );
+    let next_window_chars =
+        ((EMBED_CHUNK_WINDOW_CHARS as f64 * actual_chars_per_token / 2.0).floor() as usize).max(0);
+    let mut sub_chunks =
+        chunk_document_charwise(text, safe_max_chars, next_overlap_chars, next_window_chars);
+    if sub_chunks.len() <= 1 || sub_chunks[0].1.len() == text.len() {
+        let half = (text.len() / 2).max(1);
+        sub_chunks = chunk_document_charwise(text, half, 0, 0);
+    }
+
+    if sub_chunks.len() <= 1 || sub_chunks[0].1.len() == text.len() {
+        let fallback_text = runtime
+            .detokenize_embedding_tokens(&tokens[..CHUNK_SIZE_TOKENS.min(tokens.len())])
+            .unwrap_or_else(|_| text.to_string());
+        results.push((pos, fallback_text));
+        return;
+    }
+
+    for (sub_pos, sub_text) in sub_chunks {
+        push_chunk_within_token_limit(runtime, &sub_text, pos + sub_pos, results);
+    }
+}
+
+fn chunk_document_charwise(
+    content: &str,
+    max_chars: usize,
+    overlap_chars: usize,
+    window_chars: usize,
+) -> Vec<(usize, String)> {
+    if content.len() <= max_chars {
+        return vec![(0, content.to_string())];
+    }
+    let break_points = scan_break_points(content);
+    let code_fences = find_code_fences(content);
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < content.len() {
+        let ideal_end = (start + max_chars).min(content.len());
+        let end = if ideal_end == content.len() {
+            content.len()
+        } else {
+            best_chunk_end(
+                content,
+                &break_points,
+                &code_fences,
+                start,
+                ideal_end,
+                window_chars,
+            )
+        };
+        if end <= start {
+            break;
+        }
+        chunks.push((start, content[start..end].to_string()));
+        if end == content.len() {
+            break;
+        }
+        let mut next_start = end.saturating_sub(overlap_chars);
+        next_start = ceil_char_boundary(content, next_start.min(content.len()));
+        if next_start <= start {
+            next_start = end;
+        }
+        start = next_start;
+    }
+    if chunks.is_empty() {
+        vec![(0, content.to_string())]
+    } else {
+        chunks
+    }
+}
+
+fn scan_break_points(text: &str) -> Vec<BreakPoint> {
+    let mut points = std::collections::BTreeMap::<usize, BreakPoint>::new();
+    let mut offset = 0usize;
+    let mut prev_blank = false;
+    for line in text.split_inclusive('\n') {
+        let line_start = offset;
+        let breakpoint_pos = line_start.saturating_sub(1);
+        let trimmed = line.trim_end_matches('\n').trim();
+        if line_start > 0 {
+            points.entry(breakpoint_pos).or_insert(BreakPoint {
+                pos: breakpoint_pos,
+                score: 1.0,
+            });
+
+            if prev_blank {
+                set_break_point(&mut points, breakpoint_pos, 20.0);
+            }
+
+            let heading_score = heading_score(trimmed);
+            if heading_score > 0.0 {
+                set_break_point(&mut points, breakpoint_pos, heading_score);
+            } else if trimmed.starts_with("```") {
+                set_break_point(&mut points, breakpoint_pos, 80.0);
+            } else if matches!(trimmed, "---" | "***" | "___") {
+                set_break_point(&mut points, breakpoint_pos, 60.0);
+            } else if trimmed.starts_with("- ")
+                || trimmed.starts_with("* ")
+                || ordered_list_prefix(trimmed)
+            {
+                set_break_point(&mut points, breakpoint_pos, 5.0);
+            }
+        }
+
+        prev_blank = trimmed.is_empty();
+        offset += line.len();
+    }
+    points.into_values().collect()
+}
+
+fn set_break_point(
+    points: &mut std::collections::BTreeMap<usize, BreakPoint>,
+    pos: usize,
+    score: f64,
+) {
+    match points.get(&pos) {
+        Some(existing) if existing.score >= score => {}
+        _ => {
+            points.insert(pos, BreakPoint { pos, score });
+        }
+    }
+}
+
+fn heading_score(trimmed: &str) -> f64 {
+    let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
+    match hashes {
+        1 => 100.0,
+        2 => 90.0,
+        3 => 80.0,
+        4 => 70.0,
+        5 => 60.0,
+        6 => 50.0,
+        _ => 0.0,
+    }
+}
+
+fn ordered_list_prefix(trimmed: &str) -> bool {
+    let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    digits > 0 && trimmed[digits..].starts_with(". ")
+}
+
+fn find_code_fences(text: &str) -> Vec<CodeFenceRegion> {
+    let mut fences = Vec::new();
+    let mut in_fence = false;
+    let mut fence_start = 0usize;
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            if !in_fence {
+                fence_start = offset;
+                in_fence = true;
+            } else {
+                fences.push(CodeFenceRegion {
+                    start: fence_start,
+                    end: offset + line.len(),
+                });
+                in_fence = false;
+            }
+        }
+        offset += line.len();
+    }
+    if in_fence {
+        fences.push(CodeFenceRegion {
+            start: fence_start,
+            end: text.len(),
+        });
+    }
+    fences
+}
+
+fn is_inside_code_fence(pos: usize, fences: &[CodeFenceRegion]) -> bool {
+    fences
+        .iter()
+        .any(|fence| pos > fence.start && pos < fence.end)
+}
+
+fn best_chunk_end(
+    content: &str,
+    break_points: &[BreakPoint],
+    code_fences: &[CodeFenceRegion],
+    start: usize,
+    ideal_end: usize,
+    window_chars: usize,
+) -> usize {
+    let window_start = ideal_end.saturating_sub(window_chars);
+    let mut best_score = -1.0;
+    let mut best_pos = ideal_end;
+    for break_point in break_points {
+        if break_point.pos < window_start {
+            continue;
+        }
+        if break_point.pos > ideal_end {
+            break;
+        }
+        if break_point.pos <= start || is_inside_code_fence(break_point.pos, code_fences) {
+            continue;
+        }
+        let distance = (ideal_end - break_point.pos) as f64;
+        let normalized = distance / window_chars.max(1) as f64;
+        let multiplier = 1.0 - (normalized * normalized) * 0.7;
+        let final_score = break_point.score * multiplier;
+        if final_score > best_score {
+            best_score = final_score;
+            best_pos = break_point.pos;
+        }
+    }
+    floor_char_boundary(content, best_pos.min(content.len()).max(start + 1))
+}
+
+fn clamp_overlap_chars(value: usize, max_chars: usize) -> usize {
+    if max_chars <= 1 {
+        return 0;
+    }
+    value.min(max_chars - 1)
+}
+
+fn floor_char_boundary(content: &str, mut idx: usize) -> usize {
+    idx = idx.min(content.len());
+    while idx > 0 && !content.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn ceil_char_boundary(content: &str, mut idx: usize) -> usize {
+    idx = idx.min(content.len());
+    while idx < content.len() && !content.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+fn parse_positive_integer_option(name: &str, value: &str) -> Result<usize> {
+    let parsed = value
+        .parse::<usize>()
+        .with_context(|| format!("invalid --{name} value"))?;
+    if parsed == 0 {
+        return Err(anyhow!("--{name} must be a positive integer"));
+    }
+    Ok(parsed)
+}
+
+fn next_embed_batch_end(
+    docs: &[(String, String, String)],
+    start: usize,
+    max_docs_per_batch: usize,
+    max_batch_bytes: usize,
+) -> usize {
+    let mut end = start;
+    let mut batch_bytes = 0usize;
+    while end < docs.len() && (end - start) < max_docs_per_batch {
+        let doc_bytes = docs[end].1.len();
+        if end > start && batch_bytes.saturating_add(doc_bytes) > max_batch_bytes {
+            break;
+        }
+        batch_bytes = batch_bytes.saturating_add(doc_bytes);
+        end += 1;
+    }
+    end.max(start + 1)
 }
 
 fn average_embeddings(vectors: &[Vec<f32>]) -> Vec<f32> {
@@ -2602,6 +3233,18 @@ fn query_terms(query: &str) -> Vec<String> {
         .collect()
 }
 
+fn fallback_fts_query(query: &str) -> Option<String> {
+    let tokens = query_terms(query);
+    (!tokens.is_empty()).then(|| tokens.join(" "))
+}
+
+fn should_retry_fts_query(error: &rusqlite::Error) -> bool {
+    let message = error.to_string();
+    message.contains("fts5:")
+        || message.contains("no such column:")
+        || message.contains("unterminated string")
+}
+
 fn estimate_query_score(
     item: &SearchResultItem,
     query_terms: &[String],
@@ -2636,7 +3279,11 @@ fn vector_results(
     limit: usize,
     collections: &[String],
 ) -> Result<Vec<SearchResultItem>> {
-    let query_vector = compute_embedding(runtime, query)?;
+    if sqlite_vec::vectors_vec_is_usable(connection)? {
+        return vector_results_via_vec0(connection, runtime, index_name, query, limit, collections);
+    }
+    let formatted_query = models::format_query_for_embedding(query);
+    let query_vector = compute_embedding(runtime, &formatted_query)?;
     let rows = connection
         .prepare(
             "SELECT substr(d.hash, 1, 6) AS docid, d.collection, d.path, d.title, c.doc, qv.vector
@@ -2695,54 +3342,102 @@ fn vector_results(
         .collect())
 }
 
-fn search_results(
+fn vector_results_via_vec0(
     connection: &Connection,
+    runtime: Option<&models::LocalModelRuntime>,
     index_name: Option<&str>,
     query: &str,
     limit: usize,
     collections: &[String],
 ) -> Result<Vec<SearchResultItem>> {
-    let mut sql = String::from(
-        "SELECT substr(documents.hash, 1, 6) AS docid,
-                documents.collection,
-                documents.path,
-                documents.title,
-                content.doc
-         FROM documents_fts
-         JOIN documents ON documents_fts.rowid = documents.id
-         JOIN content ON content.hash = documents.hash
-         WHERE documents.active = 1
-           AND documents_fts MATCH ?1",
-    );
+    let formatted_query = models::format_query_for_embedding(query);
+    let query_vector = compute_embedding(runtime, &formatted_query)?;
+    let query_json = serde_json::to_string(&query_vector)?;
+    let vec_results = connection
+        .prepare(
+            "SELECT hash_seq, distance
+             FROM vectors_vec
+             WHERE embedding MATCH ?1 AND k = ?2",
+        )?
+        .query_map((query_json.as_str(), (limit * 3) as i64), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if vec_results.is_empty() {
+        return Ok(Vec::new());
+    }
 
+    let hash_seqs = vec_results
+        .iter()
+        .map(|(hash_seq, _)| hash_seq)
+        .collect::<Vec<_>>();
+    let distance_by_hash_seq = vec_results
+        .iter()
+        .map(|(hash_seq, distance)| (hash_seq.clone(), *distance))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let placeholders = hash_seqs
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("?{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sql = format!(
+        "SELECT cv.hash || '_' || cv.seq AS hash_seq,
+                cv.hash,
+                cv.pos,
+                d.collection,
+                d.path,
+                d.title,
+                c.doc
+         FROM content_vectors cv
+         JOIN documents d ON d.hash = cv.hash AND d.active = 1
+         JOIN content c ON c.hash = d.hash
+         WHERE cv.hash || '_' || cv.seq IN ({placeholders})"
+    );
+    let mut params = hash_seqs
+        .iter()
+        .map(|value| value.as_str())
+        .collect::<Vec<_>>();
     if !collections.is_empty() {
-        sql.push_str(" AND documents.collection IN (");
+        sql.push_str(" AND d.collection IN (");
         for idx in 0..collections.len() {
             if idx > 0 {
                 sql.push_str(", ");
             }
             sql.push('?');
-            sql.push_str(&(idx + 2).to_string());
+            sql.push_str(&(params.len() + idx + 1).to_string());
         }
         sql.push(')');
+        params.extend(collections.iter().map(String::as_str));
     }
-    sql.push_str(" ORDER BY bm25(documents_fts) LIMIT ");
-    sql.push_str(&limit.to_string());
+    let rows = connection
+        .prepare(&sql)?
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, usize>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let mut statement = connection.prepare(&sql)?;
-    let mut values = vec![query];
-    values.extend(collections.iter().map(String::as_str));
-    let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
-        let docid: String = row.get(0)?;
-        let collection: String = row.get(1)?;
-        let path: String = row.get(2)?;
-        let title: String = row.get(3)?;
-        let body: String = row.get(4)?;
+    let mut best_by_file = std::collections::BTreeMap::<String, (f64, SearchResultItem)>::new();
+    for (hash_seq, docid, _pos, collection, path, title, body) in rows {
+        let Some(distance) = distance_by_hash_seq.get(&hash_seq).copied() else {
+            continue;
+        };
+        let file = format!("qmd://{collection}/{path}");
+        let similarity = 1.0 - distance;
         let (line, snippet) = extract_snippet(&body, query);
-        Ok(SearchResultItem {
-            docid: format!("#{docid}"),
-            score: 0,
-            file: format!("qmd://{collection}/{path}"),
+        let item = SearchResultItem {
+            docid: format!("#{}", &docid[..6.min(docid.len())]),
+            score: (similarity * 100.0).round() as i64,
+            file: file.clone(),
             context: context_for_path(connection, index_name, &collection, &path)
                 .ok()
                 .flatten(),
@@ -2750,10 +3445,110 @@ fn search_results(
             title,
             snippet,
             rerank_text: body.chars().take(3000).collect(),
-        })
-    })?;
+        };
+        match best_by_file.get(&file) {
+            Some((best_distance, _)) if distance >= *best_distance => {}
+            _ => {
+                best_by_file.insert(file, (distance, item));
+            }
+        }
+    }
 
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    let mut values = best_by_file.into_values().collect::<Vec<_>>();
+    values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(values
+        .into_iter()
+        .take(limit)
+        .map(|(_, item)| item)
+        .collect())
+}
+
+fn search_results(
+    connection: &Connection,
+    index_name: Option<&str>,
+    query: &str,
+    limit: usize,
+    collections: &[String],
+) -> Result<Vec<SearchResultItem>> {
+    fn run_search_query(
+        connection: &Connection,
+        index_name: Option<&str>,
+        match_query: &str,
+        original_query: &str,
+        limit: usize,
+        collections: &[String],
+    ) -> rusqlite::Result<Vec<SearchResultItem>> {
+        let mut sql = String::from(
+            "SELECT substr(documents.hash, 1, 6) AS docid,
+                    documents.collection,
+                    documents.path,
+                    documents.title,
+                    content.doc
+             FROM documents_fts
+             JOIN documents ON documents_fts.rowid = documents.id
+             JOIN content ON content.hash = documents.hash
+             WHERE documents.active = 1
+               AND documents_fts MATCH ?1",
+        );
+
+        if !collections.is_empty() {
+            sql.push_str(" AND documents.collection IN (");
+            for idx in 0..collections.len() {
+                if idx > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push('?');
+                sql.push_str(&(idx + 2).to_string());
+            }
+            sql.push(')');
+        }
+        sql.push_str(" ORDER BY bm25(documents_fts) LIMIT ");
+        sql.push_str(&limit.to_string());
+
+        let mut statement = connection.prepare(&sql)?;
+        let mut values = vec![match_query];
+        values.extend(collections.iter().map(String::as_str));
+        let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+            let docid: String = row.get(0)?;
+            let collection: String = row.get(1)?;
+            let path: String = row.get(2)?;
+            let title: String = row.get(3)?;
+            let body: String = row.get(4)?;
+            let (line, snippet) = extract_snippet(&body, original_query);
+            Ok(SearchResultItem {
+                docid: format!("#{docid}"),
+                score: 0,
+                file: format!("qmd://{collection}/{path}"),
+                context: context_for_path(connection, index_name, &collection, &path)
+                    .ok()
+                    .flatten(),
+                line,
+                title,
+                snippet,
+                rerank_text: body.chars().take(3000).collect(),
+            })
+        })?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+    }
+
+    match run_search_query(connection, index_name, query, query, limit, collections) {
+        Ok(results) => Ok(results),
+        Err(error) if should_retry_fts_query(&error) => {
+            let Some(fallback_query) = fallback_fts_query(query) else {
+                return Err(error.into());
+            };
+            Ok(run_search_query(
+                connection,
+                index_name,
+                &fallback_query,
+                query,
+                limit,
+                collections,
+            )?)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn embed_text(text: &str) -> Vec<f32> {
@@ -2840,6 +3635,56 @@ struct NativeReindexResult {
     removed: usize,
 }
 
+#[derive(Debug, Default)]
+struct ReindexTrace {
+    files_seen: usize,
+    bytes_read: usize,
+    walk_ms: f64,
+    read_ms: f64,
+    hash_ms: f64,
+    title_ms: f64,
+    metadata_ms: f64,
+    content_insert_ms: f64,
+    existing_lookup_ms: f64,
+    update_doc_ms: f64,
+    insert_doc_ms: f64,
+    existing_paths_ms: f64,
+    deactivate_ms: f64,
+    tx_commit_ms: f64,
+    slowest_file_path: String,
+    slowest_file_ms: f64,
+    total_ms: f64,
+}
+
+#[derive(Debug, Default)]
+struct EmbedTrace {
+    docs_seen: usize,
+    batches: usize,
+    runtime_init_ms: f64,
+    docs_query_ms: f64,
+    compute_embeddings_ms: f64,
+    serialize_vectors_ms: f64,
+    qqd_vector_write_ms: f64,
+    content_vector_delete_ms: f64,
+    content_vector_insert_ms: f64,
+    tx_commit_ms: f64,
+    slowest_batch_index: usize,
+    slowest_batch_docs: usize,
+    slowest_batch_ms: f64,
+    total_ms: f64,
+}
+
+fn trace_indexing_enabled() -> bool {
+    env::var("QQD_TRACE_INDEXING")
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
 fn ensure_schema(connection: &Connection) -> Result<()> {
     connection.execute_batch(
         r#"
@@ -2886,12 +3731,45 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
           key TEXT PRIMARY KEY,
           value TEXT
         );
+        CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(filepath, title, body, tokenize='porter unicode61');
+        CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents
+        WHEN new.active = 1
+        BEGIN
+          INSERT INTO documents_fts(rowid, filepath, title, body)
+          SELECT
+            new.id,
+            new.collection || '/' || new.path,
+            new.title,
+            (SELECT doc FROM content WHERE hash = new.hash)
+          WHERE new.active = 1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
+          DELETE FROM documents_fts WHERE rowid = old.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents
+        BEGIN
+          DELETE FROM documents_fts WHERE rowid = old.id;
+          INSERT INTO documents_fts(rowid, filepath, title, body)
+          SELECT
+            new.id,
+            new.collection || '/' || new.path,
+            new.title,
+            (SELECT doc FROM content WHERE hash = new.hash)
+          WHERE new.active = 1;
+        END;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn ensure_qqd_vectors_schema(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        r#"
         CREATE TABLE IF NOT EXISTS qqd_vectors (
           hash TEXT PRIMARY KEY,
           vector TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
-        CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(filepath, title, body, tokenize='porter unicode61');
         "#,
     )?;
     Ok(())
@@ -2947,35 +3825,56 @@ fn upsert_store_collection(
 }
 
 fn reindex_collection_native(
-    connection: &Connection,
+    connection: &mut Connection,
     collection_path: &str,
     pattern: &str,
     collection_name: &str,
 ) -> Result<NativeReindexResult> {
+    let trace_enabled = trace_indexing_enabled();
+    let total_start = Instant::now();
+    let mut trace = ReindexTrace::default();
     let mut result = NativeReindexResult::default();
     let mut seen_paths = std::collections::HashSet::new();
     let now = current_timestamp();
+    let walk_start = Instant::now();
+    let files = walk_markdown_files(collection_path, pattern)?;
+    trace.walk_ms = elapsed_ms(walk_start);
+    let tx = connection.transaction()?;
 
-    for (relative_path, absolute_path) in walk_markdown_files(collection_path, pattern)? {
+    for (relative_path, absolute_path) in files {
+        let file_start = Instant::now();
+        trace.files_seen += 1;
         seen_paths.insert(relative_path.clone());
+        let read_start = Instant::now();
         let body = fs::read_to_string(&absolute_path)?;
+        trace.read_ms += elapsed_ms(read_start);
+        trace.bytes_read += body.len();
         if body.trim().is_empty() {
             continue;
         }
+        let hash_start = Instant::now();
         let hash = hash_content_sync(&body);
+        trace.hash_ms += elapsed_ms(hash_start);
+        let title_start = Instant::now();
         let title = extract_title(&body, &relative_path);
+        trace.title_ms += elapsed_ms(title_start);
+        let metadata_start = Instant::now();
         let metadata = fs::metadata(&absolute_path)?;
         let modified_at =
             current_timestamp_from(metadata.modified().ok()).unwrap_or_else(|| now.clone());
         let created_at =
             current_timestamp_from(metadata.created().ok()).unwrap_or_else(|| modified_at.clone());
+        trace.metadata_ms += elapsed_ms(metadata_start);
 
-        connection.execute(
+        let content_insert_start = Instant::now();
+        tx.execute(
             "INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?1, ?2, ?3)",
             (&hash, &body, &now),
         )?;
+        trace.content_insert_ms += elapsed_ms(content_insert_start);
 
-        let existing = connection
+        let existing_lookup_start = Instant::now();
+        let existing = tx
             .prepare(
                 "SELECT id, hash, title FROM documents
                  WHERE collection = ?1 AND path = ?2 AND active = 1",
@@ -2988,6 +3887,7 @@ fn reindex_collection_native(
                 ))
             })
             .optional()?;
+        trace.existing_lookup_ms += elapsed_ms(existing_lookup_start);
 
         match existing {
             Some((_id, existing_hash, existing_title))
@@ -2996,71 +3896,107 @@ fn reindex_collection_native(
                 result.unchanged += 1;
             }
             Some((id, _, _)) => {
-                connection.execute(
+                let update_doc_start = Instant::now();
+                tx.execute(
                     "UPDATE documents SET title = ?1, hash = ?2, modified_at = ?3 WHERE id = ?4",
                     (&title, &hash, &modified_at, id),
                 )?;
-                refresh_fts_row(
-                    connection,
-                    id,
-                    collection_name,
-                    &relative_path,
-                    &title,
-                    &body,
-                )?;
+                trace.update_doc_ms += elapsed_ms(update_doc_start);
                 result.updated += 1;
             }
             None => {
-                connection.execute(
+                let insert_doc_start = Instant::now();
+                tx.execute(
                     "INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
+                     ON CONFLICT(collection, path) DO UPDATE SET
+                       title = excluded.title,
+                       hash = excluded.hash,
+                       modified_at = excluded.modified_at,
+                       active = 1",
                     (collection_name, relative_path.as_str(), &title, &hash, &created_at, &modified_at),
                 )?;
-                let id = connection.last_insert_rowid();
-                refresh_fts_row(
-                    connection,
-                    id,
-                    collection_name,
-                    &relative_path,
-                    &title,
-                    &body,
-                )?;
+                trace.insert_doc_ms += elapsed_ms(insert_doc_start);
                 result.indexed += 1;
             }
         }
+
+        let file_ms = elapsed_ms(file_start);
+        if file_ms > trace.slowest_file_ms {
+            trace.slowest_file_ms = file_ms;
+            trace.slowest_file_path = relative_path;
+        }
     }
 
-    let existing_paths = connection
+    let existing_paths_start = Instant::now();
+    let existing_paths = tx
         .prepare("SELECT path FROM documents WHERE collection = ?1 AND active = 1")?
         .query_map([collection_name], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    trace.existing_paths_ms += elapsed_ms(existing_paths_start);
+    let deactivate_start = Instant::now();
     for path in existing_paths {
         if !seen_paths.contains(&path) {
-            connection.execute(
+            tx.execute(
                 "UPDATE documents SET active = 0 WHERE collection = ?1 AND path = ?2",
                 (collection_name, path.as_str()),
             )?;
             result.removed += 1;
         }
     }
+    trace.deactivate_ms += elapsed_ms(deactivate_start);
+    let tx_commit_start = Instant::now();
+    tx.commit()?;
+    trace.tx_commit_ms = elapsed_ms(tx_commit_start);
+    trace.total_ms = elapsed_ms(total_start);
+
+    if trace_enabled {
+        let per_file_divisor = trace.files_seen.max(1) as f64;
+        eprintln!(
+            "QQD_INDEX_TRACE {}",
+            serde_json::to_string(&json!({
+                "collection": collection_name,
+                "files_seen": trace.files_seen,
+                "bytes_read": trace.bytes_read,
+                "result": {
+                    "indexed": result.indexed,
+                    "updated": result.updated,
+                    "unchanged": result.unchanged,
+                    "removed": result.removed,
+                },
+                "phase_ms": {
+                    "walk": trace.walk_ms,
+                    "read": trace.read_ms,
+                    "hash": trace.hash_ms,
+                    "title": trace.title_ms,
+                    "metadata": trace.metadata_ms,
+                    "content_insert": trace.content_insert_ms,
+                    "existing_lookup": trace.existing_lookup_ms,
+                    "update_doc": trace.update_doc_ms,
+                    "insert_doc": trace.insert_doc_ms,
+                    "existing_paths": trace.existing_paths_ms,
+                    "deactivate": trace.deactivate_ms,
+                    "tx_commit": trace.tx_commit_ms,
+                    "total": trace.total_ms,
+                },
+                "per_file_ms": {
+                    "read": trace.read_ms / per_file_divisor,
+                    "hash": trace.hash_ms / per_file_divisor,
+                    "title": trace.title_ms / per_file_divisor,
+                    "metadata": trace.metadata_ms / per_file_divisor,
+                    "content_insert": trace.content_insert_ms / per_file_divisor,
+                    "existing_lookup": trace.existing_lookup_ms / per_file_divisor,
+                },
+                "fts": "maintained by documents_ai/documents_ad/documents_au triggers",
+                "slowest_file": {
+                    "path": trace.slowest_file_path,
+                    "ms": trace.slowest_file_ms,
+                },
+            }))?
+        );
+    }
 
     Ok(result)
-}
-
-fn refresh_fts_row(
-    connection: &Connection,
-    rowid: i64,
-    collection: &str,
-    path: &str,
-    title: &str,
-    body: &str,
-) -> Result<()> {
-    connection.execute("DELETE FROM documents_fts WHERE rowid = ?1", [rowid])?;
-    connection.execute(
-        "INSERT INTO documents_fts(rowid, filepath, title, body) VALUES (?1, ?2, ?3, ?4)",
-        (rowid, format!("{collection}/{path}"), title, body),
-    )?;
-    Ok(())
 }
 
 fn hash_content_sync(content: &str) -> String {
@@ -3803,6 +4739,8 @@ fn segment_match(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+    use std::path::PathBuf;
 
     #[test]
     fn rejects_complex_queries_for_native_path() {
@@ -3963,5 +4901,84 @@ mod tests {
     #[test]
     fn parses_cleanup_command() {
         assert!(CleanupConfig::parse(&["cleanup".into()]).unwrap().is_some());
+    }
+
+    #[test]
+    fn chunker_matches_qmd_fixture_count_for_doc01() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let doc_path = manifest
+            .join("tests")
+            .join("fixtures")
+            .join("qmd-corpus")
+            .join("doc-01.md");
+        let db_path = manifest
+            .join("tests")
+            .join("fixtures")
+            .join("qmd-index.sqlite");
+        if !doc_path.exists() || !db_path.exists() {
+            return;
+        }
+
+        let content = std::fs::read_to_string(&doc_path).expect("fixture doc");
+        let runtime = crate::models::runtime().expect("runtime");
+        let chunks = chunk_document_for_embedding(runtime.as_deref(), &content);
+
+        let db = Connection::open(db_path).expect("fixture db");
+        let expected: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM content_vectors cv
+                 JOIN documents d ON d.hash = cv.hash AND d.active = 1
+                 WHERE d.path = 'doc-01.md'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fixture count");
+        assert_eq!(chunks.len() as i64, expected);
+    }
+
+    #[test]
+    fn chunker_matches_qmd_fixture_counts_for_pinned_corpus() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let corpus_dir = manifest.join("tests").join("fixtures").join("qmd-corpus");
+        let db_path = manifest
+            .join("tests")
+            .join("fixtures")
+            .join("qmd-index.sqlite");
+        if !corpus_dir.is_dir() || !db_path.exists() {
+            return;
+        }
+
+        let runtime = crate::models::runtime().expect("runtime");
+        let db = Connection::open(db_path).expect("fixture db");
+        for entry in std::fs::read_dir(&corpus_dir)
+            .expect("read corpus")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().and_then(|v| v.to_str()) != Some("md") {
+                continue;
+            }
+            let rel = path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .expect("fixture file name")
+                .to_string();
+            let content = std::fs::read_to_string(&path).expect("fixture doc");
+            let chunks = chunk_document_for_embedding(runtime.as_deref(), &content);
+            let expected: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM content_vectors cv
+                     JOIN documents d ON d.hash = cv.hash AND d.active = 1
+                     WHERE d.path = ?1",
+                    [rel.as_str()],
+                    |row| row.get(0),
+                )
+                .expect("fixture count");
+            assert_eq!(
+                chunks.len() as i64,
+                expected,
+                "chunk count mismatch for {rel}"
+            );
+        }
     }
 }

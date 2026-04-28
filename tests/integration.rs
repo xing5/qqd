@@ -2,6 +2,7 @@ use rusqlite::Connection;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
@@ -100,6 +101,21 @@ fn fixture_env() -> (TempDir, std::path::PathBuf) {
     let db_path = temp.path().join("index.sqlite");
     create_fixture_db(&db_path);
     (temp, db_path)
+}
+
+fn qmd_fixture_db_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("qmd-index.sqlite")
+}
+
+fn local_embed_model_path() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").expect("HOME env"))
+        .join(".cache")
+        .join("qmd")
+        .join("models")
+        .join("hf_ggml-org_embeddinggemma-300M-Q8_0.gguf")
 }
 
 fn empty_fixture_env() -> (TempDir, std::path::PathBuf) {
@@ -282,6 +298,74 @@ fn search_json_reads_qmd_compatible_sqlite() {
     assert!(stdout.contains("\"docid\": \"#abcdef\""));
     assert!(stdout.contains("\"file\": \"qmd://docs/alpha.md\""));
     assert!(stdout.contains("\"title\": \"Alpha\""));
+}
+
+#[test]
+fn search_and_query_handle_punctuation_heavy_queries() {
+    let (_temp, db_path) = fixture_env();
+    let db = Connection::open(&db_path).expect("open fixture db");
+    db.execute(
+        "INSERT INTO content (hash, doc, created_at) VALUES (?1, ?2, datetime('now'))",
+        (
+            "112233445566",
+            "# Gamma\n\n0-dimensional biomaterials show inductive properties.\n",
+        ),
+    )
+    .expect("content gamma");
+    db.execute(
+        "INSERT INTO content (hash, doc, created_at) VALUES (?1, ?2, datetime('now'))",
+        (
+            "665544332211",
+            "# Delta\n\n1,000 genomes project enables mapping of genetic sequence variation.\n",
+        ),
+    )
+    .expect("content delta");
+    db.execute(
+        "INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active) VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now'), 1)",
+        ("docs", "gamma.md", "Gamma", "112233445566"),
+    )
+    .expect("doc gamma");
+    db.execute(
+        "INSERT INTO documents (collection, path, title, hash, created_at, modified_at, active) VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now'), 1)",
+        ("docs", "delta.md", "Delta", "665544332211"),
+    )
+    .expect("doc delta");
+    drop(db);
+
+    let search = qqd_command()
+        .env("INDEX_PATH", &db_path)
+        .args([
+            "search",
+            "--json",
+            "0-dimensional biomaterials show inductive properties.",
+        ])
+        .output()
+        .expect("punctuated search");
+    assert!(
+        search.status.success(),
+        "{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let search_stdout = String::from_utf8(search.stdout).expect("search utf8");
+    assert!(search_stdout.contains("\"file\": \"qmd://docs/gamma.md\""));
+
+    let query = qqd_command()
+        .env("INDEX_PATH", &db_path)
+        .args([
+            "query",
+            "1,000 genomes project enables mapping of genetic sequence variation.",
+            "--json",
+            "--no-rerank",
+        ])
+        .output()
+        .expect("punctuated query");
+    assert!(
+        query.status.success(),
+        "{}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    let query_stdout = String::from_utf8(query.stdout).expect("query utf8");
+    assert!(query_stdout.contains("\"file\": \"qmd://docs/delta.md\""));
 }
 
 #[test]
@@ -1078,6 +1162,163 @@ fn native_embed_does_not_require_qmd_oracle() {
     let status = String::from_utf8(status.stdout).expect("status utf8");
     assert!(status.contains("Vectors:  2 embedded"));
     assert!(!status.contains("Pending:"));
+}
+
+#[test]
+fn native_embed_supports_small_batch_limits() {
+    let (_temp, db_path) = fixture_env();
+    let output = qqd_command()
+        .env("INDEX_PATH", &db_path)
+        .args(["embed", "--max-docs-per-batch", "1", "--max-batch-mb", "1"])
+        .output()
+        .expect("batched embed");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let status = qqd_command()
+        .env("INDEX_PATH", &db_path)
+        .arg("status")
+        .output()
+        .expect("status after batched embed");
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status = String::from_utf8(status.stdout).expect("status utf8");
+    assert!(status.contains("Vectors:  2 embedded"));
+    assert!(!status.contains("Pending:"));
+}
+
+#[test]
+fn native_embed_materializes_vectors_vec_when_vec0_is_available() {
+    let (_temp, db_path) = fixture_env();
+    let output = qqd_command()
+        .env("INDEX_PATH", &db_path)
+        .args(["embed", "--force"])
+        .output()
+        .expect("embed for vectors_vec");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let db = Connection::open(&db_path).expect("open db");
+    let vectors_table: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'vectors_vec'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("vectors_vec table count");
+    let content_vectors: i64 = db
+        .query_row("SELECT COUNT(*) FROM content_vectors", [], |row| row.get(0))
+        .expect("content_vectors count");
+    assert_eq!(vectors_table, 1);
+    assert_eq!(content_vectors, 2);
+}
+
+#[test]
+fn native_embed_splits_long_documents_into_multiple_chunks() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("index.sqlite");
+    let config_dir = temp.path().join("config");
+    let docs_dir = temp.path().join("docs");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    std::fs::create_dir_all(&docs_dir).expect("docs dir");
+    std::fs::write(config_dir.join("index.yml"), "collections: {}\n").expect("config");
+    let long_body = format!(
+        "# Long Fixture\n\n{}\n",
+        "semantic chunk overlap retrieval vectors formatting ".repeat(300)
+    );
+    std::fs::write(docs_dir.join("long.md"), long_body).expect("long doc");
+
+    let add = qqd_command()
+        .env("INDEX_PATH", &db_path)
+        .env("QMD_CONFIG_DIR", &config_dir)
+        .args([
+            "collection",
+            "add",
+            docs_dir.to_str().expect("docs dir str"),
+            "--name",
+            "docs",
+        ])
+        .output()
+        .expect("collection add");
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let embed = qqd_command()
+        .env("INDEX_PATH", &db_path)
+        .env("QMD_CONFIG_DIR", &config_dir)
+        .args(["embed", "--force"])
+        .output()
+        .expect("embed long doc");
+    assert!(
+        embed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&embed.stderr)
+    );
+
+    let db = Connection::open(&db_path).expect("open db");
+    let chunk_rows: i64 = db
+        .query_row("SELECT COUNT(*) FROM content_vectors", [], |row| row.get(0))
+        .expect("chunk count");
+    let max_seq: i64 = db
+        .query_row("SELECT MAX(seq) FROM content_vectors", [], |row| row.get(0))
+        .expect("max seq");
+    assert!(
+        chunk_rows > 1,
+        "expected multiple chunk rows, got {chunk_rows}"
+    );
+    assert!(max_seq > 0, "expected seq>0, got {max_seq}");
+}
+
+#[test]
+fn query_on_qmd_fixture_does_not_create_qqd_vectors_when_vectors_vec_is_usable() {
+    let fixture = qmd_fixture_db_path();
+    if !fixture.exists() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db_path = temp.path().join("qmd-index.sqlite");
+    std::fs::copy(&fixture, &db_path).expect("copy qmd fixture");
+    let config_dir = temp.path().join("config");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    std::fs::write(config_dir.join("index.yml"), "collections: {}\n").expect("config");
+
+    let output = qqd_command()
+        .env("INDEX_PATH", &db_path)
+        .env("QMD_CONFIG_DIR", &config_dir)
+        .env("QQD_EMBED_MODEL", local_embed_model_path())
+        .args(["query", "--json", "--no-rerank", "indexing performance"])
+        .output()
+        .expect("query qmd fixture");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let db = Connection::open(&db_path).expect("open copied fixture");
+    let qqd_vectors_table: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'qqd_vectors'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("qqd_vectors table count");
+    assert_eq!(qqd_vectors_table, 0);
 }
 
 #[test]

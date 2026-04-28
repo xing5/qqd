@@ -1,0 +1,4 @@
+collections:
+  docs:
+    path: /home/xing/workspace/qqd/tests/fixtures/qmd-corpus
+    pattern: "**/*.md"

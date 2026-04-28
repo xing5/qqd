@@ -2,6 +2,7 @@ mod benchmark;
 mod mcp;
 mod models;
 mod native;
+mod sqlite_vec;
 
 use anyhow::{Result, anyhow};
 use std::env;

@@ -1,0 +1,46 @@
+{
+  "upstream_commit": "e8de7cab0284c5d64bd64f5928b49d3a2d9a01f3",
+  "collection": "docs",
+  "queries": [
+    {
+      "name": "indexing_performance",
+      "query": "indexing performance",
+      "expected_top1": "qmd://docs/doc-01.md"
+    },
+    {
+      "name": "vector_retrieval",
+      "query": "vector retrieval",
+      "expected_top1": "qmd://docs/doc-02.md"
+    },
+    {
+      "name": "semantic_embeddings",
+      "query": "semantic embeddings",
+      "expected_top1": "qmd://docs/doc-03.md"
+    },
+    {
+      "name": "sqlite_vec_extension",
+      "query": "sqlite vec extension",
+      "expected_top1": "qmd://docs/doc-04.md"
+    },
+    {
+      "name": "chunk_overlap",
+      "query": "chunk overlap",
+      "expected_top1": "qmd://docs/doc-05.md"
+    },
+    {
+      "name": "rerank_pipeline",
+      "query": "rerank pipeline",
+      "expected_top1": "qmd://docs/doc-06.md"
+    },
+    {
+      "name": "mcp_query",
+      "query": "mcp query",
+      "expected_top1": "qmd://docs/doc-07.md"
+    },
+    {
+      "name": "hybrid_search",
+      "query": "hybrid search",
+      "expected_top1": "qmd://docs/doc-12.md"
+    }
+  ]
+}
